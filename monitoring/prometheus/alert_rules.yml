@@ -1,0 +1,83 @@
+groups:
+  - name: fraud_detection_alerts
+    rules:
+
+      # ── Model Performance Alerts ──────────────────────────────────────────
+      - alert: FraudRecallLow
+        expr: fraud_recall_current < 0.80
+        for: 5m
+        labels:
+          severity: critical
+          component: model
+        annotations:
+          summary: "Fraud recall dropped below threshold"
+          description: "Fraud recall is {{ $value | humanizePercentage }} (threshold: 80%). Model retraining required."
+
+      - alert: HighFalsePositiveRate
+        expr: fraud_false_positive_rate > 0.15
+        for: 10m
+        labels:
+          severity: warning
+          component: model
+        annotations:
+          summary: "High false positive rate detected"
+          description: "FPR is {{ $value | humanizePercentage }} — too many legitimate transactions flagged."
+
+      # ── API Performance Alerts ────────────────────────────────────────────
+      - alert: HighAPILatency
+        expr: histogram_quantile(0.95, rate(fraud_api_request_latency_seconds_bucket[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "API p95 latency exceeds 1 second"
+          description: "95th percentile latency is {{ $value }}s"
+
+      - alert: HighErrorRate
+        expr: rate(fraud_api_requests_total{status=~"5.."}[5m]) / rate(fraud_api_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "API error rate above 5%"
+          description: "Error rate is {{ $value | humanizePercentage }}"
+
+      - alert: APIDown
+        expr: up{job="fraud-detection-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "Fraud Detection API is DOWN"
+          description: "The API has been unreachable for more than 1 minute."
+
+      # ── Data Drift Alerts ─────────────────────────────────────────────────
+      - alert: PredictionDistributionShift
+        expr: |
+          abs(
+            avg_over_time(fraud_prediction_confidence_sum[1h]) /
+            avg_over_time(fraud_prediction_confidence_count[1h])
+            -
+            avg_over_time(fraud_prediction_confidence_sum[24h]) /
+            avg_over_time(fraud_prediction_confidence_count[24h])
+          ) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          component: data_drift
+        annotations:
+          summary: "Prediction confidence distribution shifted"
+          description: "Average confidence shifted by more than 10% vs 24h baseline — possible data drift."
+
+      - alert: LowRequestVolume
+        expr: rate(fraud_api_requests_total[15m]) < 0.01
+        for: 30m
+        labels:
+          severity: info
+          component: api
+        annotations:
+          summary: "Very low prediction volume"
+          description: "Fewer than 1 request per 100 seconds — system may be idle."

@@ -1,0 +1,44 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: fraud-detection-run-
+  namespace: kubeflow
+spec:
+  entrypoint: fraud-detection-pipeline
+  arguments:
+    parameters:
+      - name: transaction_path
+        value: /data/train_transaction.csv
+      - name: identity_path
+        value: /data/train_identity.csv
+      - name: imbalance_strategy
+        value: smote
+      - name: accuracy_threshold
+        value: "0.90"
+      - name: recall_threshold
+        value: "0.80"
+  volumeClaimTemplates:
+    - metadata:
+        name: pipeline-workspace
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+  templates:
+    - name: fraud-detection-pipeline
+      steps:
+        - - name: data-ingestion
+            template: data-ingestion-step
+        - - name: data-validation
+            template: data-validation-step
+        - - name: preprocessing
+            template: preprocessing-step
+        - - name: feature-engineering
+            template: feature-engineering-step
+        - - name: model-training
+            template: model-training-step
+        - - name: model-evaluation
+            template: model-evaluation-step
+        - - name: deployment
+            template: deployment-step

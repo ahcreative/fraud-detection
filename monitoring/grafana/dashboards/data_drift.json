@@ -1,0 +1,71 @@
+{
+  "title": "Fraud Detection — Data Drift",
+  "uid": "fraud-data-drift",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "1m",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Fraud Probability Moving Average (1h vs 24h baseline)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "avg_over_time(fraud_prediction_confidence_sum[1h]) / avg_over_time(fraud_prediction_confidence_count[1h])",
+          "legendFormat": "1h avg confidence"
+        },
+        {
+          "expr": "avg_over_time(fraud_prediction_confidence_sum[24h]) / avg_over_time(fraud_prediction_confidence_count[24h])",
+          "legendFormat": "24h baseline"
+        }
+      ],
+      "description": "Significant divergence between 1h and 24h averages indicates distribution shift"
+    },
+    {
+      "id": 2,
+      "title": "Drift Alert Status",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 8},
+      "targets": [{
+        "expr": "ALERTS{alertname='PredictionDistributionShift'}",
+        "legendFormat": "Drift Alert"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"options": {"0": {"text": "OK", "color": "green"}}, "type": "value"},
+            {"options": {"1": {"text": "DRIFTING", "color": "red"}}, "type": "value"}
+          ]
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Prediction Volume Trend",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 18, "x": 6, "y": 8},
+      "targets": [
+        {
+          "expr": "rate(fraud_predictions_total{prediction='fraud'}[10m])",
+          "legendFormat": "Fraud rate/min"
+        },
+        {
+          "expr": "rate(fraud_predictions_total{prediction='legitimate'}[10m])",
+          "legendFormat": "Legit rate/min"
+        }
+      ],
+      "description": "Unusual spikes or drops in fraud detection rate may indicate data drift"
+    },
+    {
+      "id": 4,
+      "title": "Alert History",
+      "type": "table",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 16},
+      "targets": [{
+        "expr": "ALERTS{job='fraud-detection-api'}",
+        "legendFormat": "{{alertname}} - {{severity}}"
+      }]
+    }
+  ]
+}

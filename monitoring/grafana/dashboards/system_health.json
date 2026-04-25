@@ -1,0 +1,96 @@
+{
+  "title": "Fraud Detection — System Health",
+  "uid": "fraud-system-health",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "API Request Rate (req/s)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{
+        "expr": "rate(fraud_api_requests_total[1m])",
+        "legendFormat": "Requests/s"
+      }],
+      "options": {"colorMode": "background", "graphMode": "area"}
+    },
+    {
+      "id": 2,
+      "title": "API p95 Latency (ms)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [{
+        "expr": "histogram_quantile(0.95, rate(fraud_api_request_latency_seconds_bucket[5m])) * 1000",
+        "legendFormat": "p95 latency"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": 0},
+              {"color": "yellow", "value": 500},
+              {"color": "red", "value": 1000}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Error Rate (%)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [{
+        "expr": "rate(fraud_api_requests_total{status=~\"5..\"}[5m]) / rate(fraud_api_requests_total[5m]) * 100",
+        "legendFormat": "Error %"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": 0},
+              {"color": "yellow", "value": 1},
+              {"color": "red", "value": 5}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Total Predictions (Last Hour)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [{
+        "expr": "increase(fraud_api_requests_total{endpoint=\"/predict\"}[1h])",
+        "legendFormat": "Predictions"
+      }]
+    },
+    {
+      "id": 5,
+      "title": "Request Rate Over Time",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [{
+        "expr": "rate(fraud_api_requests_total[1m])",
+        "legendFormat": "{{status}}"
+      }]
+    },
+    {
+      "id": 6,
+      "title": "Latency Percentiles",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(fraud_api_request_latency_seconds_bucket[5m]))*1000", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, rate(fraud_api_request_latency_seconds_bucket[5m]))*1000", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, rate(fraud_api_request_latency_seconds_bucket[5m]))*1000", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms"}}
+    }
+  ]
+}

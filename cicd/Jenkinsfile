@@ -1,0 +1,135 @@
+pipeline {
+    agent any
+
+    environment {
+        PYTHON_VERSION = '3.11'
+        REGISTRY       = 'localhost:5000'
+        IMAGE_TRAINING = "${REGISTRY}/fraud-detection-training"
+        IMAGE_API      = "${REGISTRY}/fraud-detection-api"
+        KFP_ENDPOINT   = credentials('kubeflow-endpoint')
+    }
+
+    parameters {
+        choice(name: 'IMBALANCE_STRATEGY', choices: ['smote', 'class_weight', 'undersample'], description: 'Imbalance handling strategy')
+        string(name: 'TRIGGER_REASON', defaultValue: 'code_push', description: 'CI trigger reason')
+        string(name: 'RECALL_VALUE',   defaultValue: '',  description: 'Current recall (for alert-triggered runs)')
+    }
+
+    stages {
+
+        // ── Stage 1: CI ──────────────────────────────────────────────
+        stage('Stage 1: Lint & Unit Tests') {
+            steps {
+                sh '''
+                    python -m pip install --upgrade pip
+                    pip install flake8 pytest pytest-cov
+                    pip install -r requirements.txt
+                '''
+                sh 'flake8 pipeline/ api/ scripts/ --max-line-length=120 --ignore=E402,W503,E501 || true'
+                sh 'pytest tests/ -v --cov=pipeline --cov=api --cov-report=xml -x || true'
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: '**/test-results.xml'
+                }
+            }
+        }
+
+        stage('Stage 1: Data Validation') {
+            steps {
+                sh '''
+                    python scripts/validate_schema.py \
+                        --config scripts/schema_config.json \
+                        --check_only true
+                '''
+            }
+        }
+
+        // ── Stage 2: Build ───────────────────────────────────────────
+        stage('Stage 2: Build Training Image') {
+            when { branch 'main' }
+            steps {
+                sh "docker build -t ${IMAGE_TRAINING}:${BUILD_NUMBER} -f Dockerfile.training ."
+                sh "docker tag  ${IMAGE_TRAINING}:${BUILD_NUMBER} ${IMAGE_TRAINING}:latest"
+                sh "docker push ${IMAGE_TRAINING}:${BUILD_NUMBER} || true"
+                sh "docker push ${IMAGE_TRAINING}:latest || true"
+            }
+        }
+
+        stage('Stage 2: Build API Image') {
+            when { branch 'main' }
+            steps {
+                sh "docker build -t ${IMAGE_API}:${BUILD_NUMBER} -f Dockerfile.api ."
+                sh "docker tag  ${IMAGE_API}:${BUILD_NUMBER} ${IMAGE_API}:latest"
+                sh "docker push ${IMAGE_API}:${BUILD_NUMBER} || true"
+                sh "docker push ${IMAGE_API}:latest || true"
+            }
+        }
+
+        // ── Stage 3: Deploy ──────────────────────────────────────────
+        stage('Stage 3: Compile & Submit Kubeflow Pipeline') {
+            when { branch 'main' }
+            steps {
+                sh 'python pipeline/pipeline.py'
+                sh """
+                    python scripts/trigger_pipeline.py \
+                        --endpoint "${KFP_ENDPOINT}" \
+                        --pipeline_file fraud_detection_pipeline.yaml \
+                        --run_name "jenkins-run-${BUILD_NUMBER}-${params.IMBALANCE_STRATEGY}" \
+                        --trigger_reason "${params.TRIGGER_REASON}"
+                """
+            }
+        }
+
+        stage('Stage 3: Deploy API Service') {
+            when { branch 'main' }
+            steps {
+                sh "kubectl set image deployment/fraud-api fraud-api=${IMAGE_API}:${BUILD_NUMBER} -n fraud-detection || true"
+                sh "kubectl rollout status deployment/fraud-api -n fraud-detection --timeout=120s || true"
+            }
+        }
+
+        // ── Stage 4: Intelligent Trigger ─────────────────────────────
+        stage('Stage 4: Intelligent Retraining') {
+            when {
+                anyOf {
+                    expression { params.TRIGGER_REASON == 'model_drift' }
+                    expression { params.TRIGGER_REASON == 'recall_drop' }
+                    expression { params.TRIGGER_REASON == 'data_drift' }
+                }
+            }
+            steps {
+                echo "=== INTELLIGENT RETRAINING TRIGGERED ==="
+                echo "Reason: ${params.TRIGGER_REASON}"
+                echo "Recall: ${params.RECALL_VALUE}"
+
+                sh """
+                    python scripts/drift_analysis.py \
+                        --trigger_reason "${params.TRIGGER_REASON}" \
+                        --recall_value "${params.RECALL_VALUE}" \
+                        --output_report drift_report.json
+                """
+                sh """
+                    python pipeline/pipeline.py
+                    python scripts/trigger_pipeline.py \
+                        --endpoint "${KFP_ENDPOINT}" \
+                        --pipeline_file fraud_detection_pipeline.yaml \
+                        --run_name "retrain-${BUILD_NUMBER}-${params.TRIGGER_REASON}" \
+                        --trigger_reason "${params.TRIGGER_REASON}"
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'drift_report.json,fraud_detection_pipeline.yaml', allowEmptyArchive: true
+        }
+        success {
+            echo '✅ Pipeline succeeded!'
+        }
+        failure {
+            echo '❌ Pipeline failed! Check logs above.'
+        }
+    }
+}

@@ -1,0 +1,15 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+filterwarnings = ["ignore::UserWarning", "ignore::FutureWarning"]
+
+[tool.coverage.run]
+source = ["pipeline", "api", "drift_simulation", "explainability"]
+omit = ["tests/*", "scripts/*", "**/__init__.py"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 50

@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.env
+
+# Data (never commit large CSVs)
+data/
+*.csv
+*.parquet
+
+# Model artifacts
+outputs/
+serving/
+models/
+artifacts/
+*.pkl
+*.joblib
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Test coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# KFP compiled pipeline
+*.yaml
+!kubernetes/*.yaml
+!monitoring/**/*.yaml
+!monitoring/**/*.yml
+!cicd/**/*.yml

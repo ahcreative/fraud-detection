@@ -1,0 +1,252 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IEEE CIS Fraud Detection — Complete Docker Compose
+#  Run: docker-compose up --build
+#  Everything executes automatically. No manual steps.
+# ══════════════════════════════════════════════════════════════════════════════
+
+x-pipeline-env: &pipeline-env
+  DATA_DIR: /data
+  OUTPUT_DIR: /outputs
+  ARTIFACTS_DIR: /artifacts
+  SERVING_DIR: /serving
+  SAMPLE_FRAC: "0.3" # 30% of data — safe for 16GB RAM
+  AUC_THRESHOLD: "0.88" # deploy only if AUC-ROC >= this
+  RECALL_THRESHOLD: "0.75" # deploy only if recall >= this
+  PREDICT_THRESHOLD: "0.5" # fraud classification threshold
+  SHAP_SAMPLE: "800" # SHAP sample size (keep low for memory)
+  PUSHGATEWAY_URL: "http://pushgateway:9091"
+  PYTHONPATH: /app
+  PYTHONUNBUFFERED: "1"
+
+services:
+  # ════════════════════════════════════════════════════════════════════════════
+  # PIPELINE RUNNER
+  # Runs all 16 steps automatically: ingestion → training → test predictions
+  # → cost analysis → drift → retraining comparison → SHAP → deployment
+  # ════════════════════════════════════════════════════════════════════════════
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    container_name: fraud-pipeline
+    environment:
+      <<: *pipeline-env
+    volumes:
+      - ./data:/data:ro # READ-ONLY: your CSV files go here
+      - pipeline-outputs:/outputs
+      - pipeline-artifacts:/artifacts
+      - pipeline-serving:/serving
+    networks:
+      - fraud-net
+    depends_on:
+      pushgateway:
+        condition: service_started
+    restart: "no" # run once, then stop
+    deploy:
+      resources:
+        limits:
+          cpus: "3.5"
+          memory: "10G"
+        reservations:
+          cpus: "2"
+          memory: "6G"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # INFERENCE API
+  # Starts after pipeline completes and model is deployed to /serving
+  # Exposes: POST /predict, GET /health, GET /metrics, GET /predictions/stats
+  # ════════════════════════════════════════════════════════════════════════════
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: fraud-api
+    environment:
+      SERVING_DIR: /serving
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+    volumes:
+      - pipeline-serving:/serving:ro # READ-ONLY: uses model from pipeline
+      - pipeline-artifacts:/artifacts:ro
+    networks:
+      - fraud-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: "2G"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PROMETHEUS — Metrics collection
+  # Scrapes: API /metrics, Pushgateway, Node Exporter
+  # Access: http://localhost:9090
+  # ════════════════════════════════════════════════════════════════════════════
+  prometheus:
+    image: prom/prometheus:v2.49.1
+    container_name: fraud-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+    networks:
+      - fraud-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PUSHGATEWAY — Receives pipeline metrics pushed from orchestrator
+  # Pipeline pushes: recall, precision, AUC-ROC, business cost after training
+  # ════════════════════════════════════════════════════════════════════════════
+  pushgateway:
+    image: prom/pushgateway:v1.7.0
+    container_name: fraud-pushgateway
+    ports:
+      - "9091:9091"
+    networks:
+      - fraud-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "128M"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # GRAFANA — Monitoring dashboards
+  # 3 dashboards: System Health, Model Performance, Data Drift
+  # Access: http://localhost:3000  (admin / admin123)
+  # ════════════════════════════════════════════════════════════════════════════
+  grafana:
+    image: grafana/grafana:10.3.1
+    container_name: fraud-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/model_performance.json
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - fraud-net
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "512M"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # ALERTMANAGER — Routes Prometheus alerts
+  # Sends webhooks to API /alerts/webhook which triggers retraining
+  # Access: http://localhost:9093
+  # ════════════════════════════════════════════════════════════════════════════
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: fraud-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/prometheus/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    networks:
+      - fraud-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "128M"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # NODE EXPORTER — System-level metrics (CPU, RAM, disk)
+  # ════════════════════════════════════════════════════════════════════════════
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    container_name: fraud-node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.rootfs=/rootfs"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    networks:
+      - fraud-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: "64M"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NAMED VOLUMES — persist data between container restarts
+# ══════════════════════════════════════════════════════════════════════════════
+volumes:
+  pipeline-outputs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./outputs # maps to ./outputs on Windows host
+
+  pipeline-artifacts:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./artifacts
+
+  pipeline-serving:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./serving
+
+  prometheus-data:
+  grafana-data:
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NETWORK
+# ══════════════════════════════════════════════════════════════════════════════
+networks:
+  fraud-net:
+    driver: bridge

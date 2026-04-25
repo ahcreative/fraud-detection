@@ -1,0 +1,23 @@
+{
+  "train_transaction": {
+    "required_cols": [
+      "TransactionID", "isFraud", "TransactionDT", "TransactionAmt",
+      "ProductCD", "card1", "card2", "card3", "card4", "card5", "card6"
+    ],
+    "numeric_cols": [
+      "TransactionID", "isFraud", "TransactionDT", "TransactionAmt",
+      "card1", "card2", "card3", "card5",
+      "addr1", "addr2", "dist1", "dist2"
+    ],
+    "text_cols": ["ProductCD", "card4", "card6", "P_emaildomain", "R_emaildomain"],
+    "min_rows": 100000,
+    "target_col": "isFraud",
+    "target_values": [0, 1]
+  },
+  "train_identity": {
+    "required_cols": ["TransactionID"],
+    "numeric_cols": ["TransactionID"],
+    "text_cols": ["DeviceType", "DeviceInfo"],
+    "min_rows": 1000
+  }
+}
