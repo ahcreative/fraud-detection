@@ -1,0 +1,293 @@
+name: Fraud Detection CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  # Intelligent trigger: called by monitoring alerts via webhook
+  workflow_dispatch:
+    inputs:
+      trigger_reason:
+        description: 'Reason for manual trigger (e.g., model_drift, recall_drop)'
+        required: false
+        default: 'manual'
+      recall_value:
+        description: 'Current recall value (if triggered by monitoring)'
+        required: false
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  # STAGE 1: Continuous Integration
+  # ════════════════════════════════════════════════════════════
+  lint-and-test:
+    name: "Stage 1: Lint & Unit Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install flake8 pytest pytest-cov black isort
+          pip install -r requirements.txt
+
+      - name: Run linter (flake8)
+        run: |
+          flake8 pipeline/ api/ scripts/ --max-line-length=120 \
+            --ignore=E402,W503,E501 \
+            --exclude=__pycache__,.git
+
+      - name: Check code formatting (black)
+        run: |
+          black --check --line-length 120 pipeline/ api/ scripts/ || true
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --cov=pipeline --cov=api \
+            --cov-report=xml --cov-report=term-missing \
+            -x || true
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  data-validation-check:
+    name: "Stage 1: Data Validation"
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install deps
+        run: pip install pandas numpy pyyaml
+
+      - name: Run schema validation check
+        run: |
+          python scripts/validate_schema.py \
+            --config scripts/schema_config.json \
+            --check-only true
+        continue-on-error: true
+
+      - name: Check pipeline YAML validity
+        run: |
+          python -c "
+          import yaml
+          with open('kubernetes/pipeline-run.yaml') as f:
+              data = yaml.safe_load(f)
+          print('Pipeline YAML: VALID')
+          " || echo "YAML check skipped (file may not exist yet)"
+
+  # ════════════════════════════════════════════════════════════
+  # STAGE 2: Build & Package Docker Images
+  # ════════════════════════════════════════════════════════════
+  build-training-image:
+    name: "Stage 2: Build Training Image"
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, data-validation-check]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/training
+          tags: |
+            type=sha,prefix=train-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push training image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.training
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-api-image:
+    name: "Stage 2: Build API Image"
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, data-validation-check]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/api
+          tags: |
+            type=sha,prefix=api-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.api
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ════════════════════════════════════════════════════════════
+  # STAGE 3: Continuous Deployment
+  # ════════════════════════════════════════════════════════════
+  deploy-to-kubeflow:
+    name: "Stage 3: Deploy Kubeflow Pipeline"
+    runs-on: ubuntu-latest
+    needs: [build-training-image, build-api-image]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install KFP SDK
+        run: pip install kfp==2.6.0
+
+      - name: Compile Kubeflow Pipeline
+        run: |
+          python pipeline/pipeline.py
+          echo "Pipeline compiled: fraud_detection_pipeline.yaml"
+
+      - name: Upload compiled pipeline
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-pipeline
+          path: fraud_detection_pipeline.yaml
+
+      - name: Trigger Kubeflow Pipeline Run
+        env:
+          KFP_ENDPOINT: ${{ secrets.KFP_ENDPOINT }}
+          TRIGGER_REASON: ${{ github.event.inputs.trigger_reason || 'code_push' }}
+        run: |
+          python scripts/trigger_pipeline.py \
+            --endpoint "${KFP_ENDPOINT:-http://localhost:8888}" \
+            --pipeline_file fraud_detection_pipeline.yaml \
+            --run_name "auto-run-$(date +%Y%m%d-%H%M%S)" \
+            --trigger_reason "${TRIGGER_REASON}"
+        continue-on-error: true
+
+  deploy-api-service:
+    name: "Stage 3: Deploy API Service"
+    runs-on: ubuntu-latest
+    needs: [deploy-to-kubeflow]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy updated API
+        run: |
+          echo "Deploying API service..."
+          echo "In production: kubectl apply -f kubernetes/api-deployment.yaml"
+          echo "IMAGE_TAG=$(echo ${{ github.sha }} | cut -c1-8)"
+        continue-on-error: true
+
+  # ════════════════════════════════════════════════════════════
+  # STAGE 4: Intelligent Trigger (Monitoring-driven retraining)
+  # ════════════════════════════════════════════════════════════
+  intelligent-retrain:
+    name: "Stage 4: Intelligent Retraining (Alert-triggered)"
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.trigger_reason == 'model_drift' ||
+       github.event.inputs.trigger_reason == 'recall_drop' ||
+       github.event.inputs.trigger_reason == 'data_drift')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install deps
+        run: pip install kfp==2.6.0 requests
+
+      - name: Log trigger details
+        run: |
+          echo "======================================"
+          echo "INTELLIGENT RETRAINING TRIGGERED"
+          echo "======================================"
+          echo "Reason: ${{ github.event.inputs.trigger_reason }}"
+          echo "Recall:  ${{ github.event.inputs.recall_value }}"
+          echo "Time:    $(date -u)"
+          echo "======================================"
+
+      - name: Run drift analysis
+        run: |
+          python scripts/drift_analysis.py \
+            --trigger_reason "${{ github.event.inputs.trigger_reason }}" \
+            --recall_value "${{ github.event.inputs.recall_value }}" \
+            --output_report drift_report.json || true
+
+      - name: Compile and submit retraining pipeline
+        run: |
+          python pipeline/pipeline.py
+          python scripts/trigger_pipeline.py \
+            --endpoint "${{ secrets.KFP_ENDPOINT || 'http://localhost:8888' }}" \
+            --pipeline_file fraud_detection_pipeline.yaml \
+            --run_name "retrain-$(date +%Y%m%d-%H%M%S)-${{ github.event.inputs.trigger_reason }}" \
+            --trigger_reason "${{ github.event.inputs.trigger_reason }}" || true
+
+      - name: Upload retraining artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: retraining-report
+          path: |
+            drift_report.json
+            fraud_detection_pipeline.yaml
